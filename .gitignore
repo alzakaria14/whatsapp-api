@@ -1,0 +1,9 @@
+.env
+data/
+*.db
+*.db-shm
+*.db-wal
+*.exe
+.gocache/
+*.md
+!README.md
