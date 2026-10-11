@@ -7,3 +7,5 @@ data/
 .gocache/
 *.md
 !README.md
+*tar.gz
+bin/

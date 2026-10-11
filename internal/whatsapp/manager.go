@@ -178,6 +178,7 @@ func (m *Manager) handleMessage(numberID string, evt *events.Message) {
 	if remote.IsEmpty() {
 		remote = evt.Info.Chat
 	}
+	remotePhone := phoneNumberJID(remote, evt.Info.SenderAlt)
 	chat := evt.Info.Chat
 	if chat.IsEmpty() {
 		chat = remote
@@ -185,7 +186,7 @@ func (m *Manager) handleMessage(numberID string, evt *events.Message) {
 	text, messageType := extractText(evt.Message)
 	raw, _ := json.Marshal(evt.Message)
 	msg := appstore.Message{
-		NumberID: numberID, Direction: "inbound", RemotePhone: normalizePhone(remote.User),
+		NumberID: numberID, Direction: "inbound", RemotePhone: normalizePhone(remotePhone.User),
 		RemoteJID: chat.String(), WAMessageID: string(evt.Info.ID), Type: messageType,
 		Text: text, Status: "received", RawJSON: raw,
 	}
@@ -200,11 +201,24 @@ func (m *Manager) handleMessage(numberID string, evt *events.Message) {
 	}
 	payload, _ := json.Marshal(map[string]any{
 		"event": "message.received", "number": map[string]any{"id": number.ID, "phone": number.Phone},
-		"message": map[string]any{"id": id, "wa_message_id": evt.Info.ID, "from": msg.RemotePhone, "from_jid": remote.String(), "chat_jid": chat.String(), "type": messageType, "text": text, "timestamp": evt.Info.Timestamp},
+		"message": map[string]any{"id": id, "wa_message_id": evt.Info.ID, "from": msg.RemotePhone, "from_jid": remote.String(), "from_alt_jid": evt.Info.SenderAlt.String(), "chat_jid": chat.String(), "type": messageType, "text": text, "timestamp": evt.Info.Timestamp},
 	})
 	if _, err := m.store.QueueDelivery(context.Background(), numberID, id, number.WebhookURL, payload); err != nil {
 		m.log.Error("gagal membuat antrean webhook", "error", err)
 	}
+}
+
+// WhatsApp may address incoming messages using an internal LID and expose the
+// sender's phone-number JID in SenderAlt. Prefer a PN JID so webhook consumers
+// can safely match the sender against a registered phone number.
+func phoneNumberJID(primary, alternate types.JID) types.JID {
+	if primary.Server == types.DefaultUserServer {
+		return primary
+	}
+	if !alternate.IsEmpty() && alternate.Server == types.DefaultUserServer {
+		return alternate
+	}
+	return primary
 }
 
 func (m *Manager) SendText(ctx context.Context, numberID, to, text string) (string, error) {
