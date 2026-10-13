@@ -1,6 +1,8 @@
 package whatsapp
 
 import (
+	"database/sql"
+	"path/filepath"
 	"testing"
 
 	waCompanionReg "go.mau.fi/whatsmeow/proto/waCompanionReg"
@@ -46,5 +48,45 @@ func TestConfigureChromeIdentity(t *testing.T) {
 	}
 	if got := waStore.BaseClientPayload.GetWebInfo().GetBrowser(); got != "Google Chrome" {
 		t.Fatalf("browser = %q", got)
+	}
+}
+
+func TestConfigureSQLiteSessionDSNAddsLockSettings(t *testing.T) {
+	got := configureSQLiteSessionDSN("file:data/whatsapp.db?_foreign_keys=on")
+	want := "file:data/whatsapp.db?_busy_timeout=10000&_foreign_keys=on&_journal_mode=WAL"
+	if got != want {
+		t.Fatalf("configureSQLiteSessionDSN() = %q, want %q", got, want)
+	}
+}
+
+func TestConfigureSQLiteSessionDSNRespectsExplicitSettings(t *testing.T) {
+	got := configureSQLiteSessionDSN("file:data/whatsapp.db?_busy_timeout=25000&_journal=DELETE")
+	want := "file:data/whatsapp.db?_busy_timeout=25000&_journal=DELETE"
+	if got != want {
+		t.Fatalf("configureSQLiteSessionDSN() = %q, want %q", got, want)
+	}
+}
+
+func TestConfigureSQLiteSessionDSNConfiguresDriverPragmas(t *testing.T) {
+	dsn := configureSQLiteSessionDSN("file:" + filepath.ToSlash(filepath.Join(t.TempDir(), "session.db")) + "?_foreign_keys=on")
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	var busyTimeout int
+	if err := db.QueryRow("PRAGMA busy_timeout").Scan(&busyTimeout); err != nil {
+		t.Fatal(err)
+	}
+	if busyTimeout != 10000 {
+		t.Fatalf("busy_timeout = %d, want 10000", busyTimeout)
+	}
+	var journalMode string
+	if err := db.QueryRow("PRAGMA journal_mode").Scan(&journalMode); err != nil {
+		t.Fatal(err)
+	}
+	if journalMode != "wal" {
+		t.Fatalf("journal_mode = %q, want wal", journalMode)
 	}
 }

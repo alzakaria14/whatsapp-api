@@ -2,14 +2,17 @@ package whatsapp
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"go.mau.fi/whatsmeow"
 	waCompanionReg "go.mau.fi/whatsmeow/proto/waCompanionReg"
@@ -42,6 +45,7 @@ type Manager struct {
 
 func New(ctx context.Context, sessionDSN, logLevel string, appStore *appstore.Store, logger *slog.Logger) (*Manager, error) {
 	configureChromeIdentity()
+	sessionDSN = configureSQLiteSessionDSN(sessionDSN)
 	if strings.HasPrefix(sessionDSN, "file:") {
 		path := strings.TrimPrefix(strings.Split(sessionDSN, "?")[0], "file:")
 		if dir := filepath.Dir(path); dir != "." {
@@ -50,8 +54,19 @@ func New(ctx context.Context, sessionDSN, logLevel string, appStore *appstore.St
 			}
 		}
 	}
-	container, err := sqlstore.New(ctx, "sqlite", sessionDSN, waLog.Stdout("WA-DB", logLevel, true))
+	// WhatsApp sync performs many small, concurrent writes (keys, app state,
+	// contacts and receipts). SQLite has a single writer, so a one-connection
+	// pool serializes our own writes instead of letting them contend and return
+	// SQLITE_BUSY. The DSN busy timeout still covers a short external lock.
+	db, err := sql.Open("sqlite", sessionDSN)
 	if err != nil {
+		return nil, fmt.Errorf("membuka session store WhatsApp: %w", err)
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	container := sqlstore.NewWithDB(db, "sqlite", waLog.Stdout("WA-DB", logLevel, true))
+	if err := container.Upgrade(ctx); err != nil {
+		_ = container.Close()
 		return nil, fmt.Errorf("membuka session store WhatsApp: %w", err)
 	}
 	m := &Manager{
@@ -63,6 +78,28 @@ func New(ctx context.Context, sessionDSN, logLevel string, appStore *appstore.St
 		return nil, err
 	}
 	return m, nil
+}
+
+// configureSQLiteSessionDSN applies connection-level SQLite settings to every
+// connection created by database/sql inside whatsmeow's sqlstore. A session
+// receives concurrent writes while it is syncing history, keys and app state;
+// without a busy timeout those writes can fail immediately with SQLITE_BUSY.
+// WAL permits readers to proceed while a writer is active. Both settings are
+// safe to keep in the DSN and are applied again to newly opened connections.
+func configureSQLiteSessionDSN(sessionDSN string) string {
+	parsed, err := url.Parse(sessionDSN)
+	if err != nil || parsed.Scheme != "file" || strings.HasPrefix(sessionDSN, "file::memory:") {
+		return sessionDSN
+	}
+	query := parsed.Query()
+	if query.Get("_busy_timeout") == "" && query.Get("_timeout") == "" {
+		query.Set("_busy_timeout", "10000")
+	}
+	if query.Get("_journal_mode") == "" && query.Get("_journal") == "" {
+		query.Set("_journal_mode", "WAL")
+	}
+	parsed.RawQuery = query.Encode()
+	return parsed.String()
 }
 
 func (m *Manager) restore(ctx context.Context, logLevel string) error {
@@ -79,12 +116,9 @@ func (m *Manager) restore(ctx context.Context, logLevel string) error {
 			m.log.Warn("sesi WhatsApp tidak mempunyai nomor dashboard", "jid", device.ID.String())
 			continue
 		}
-		client := whatsmeow.NewClient(device, waLog.Stdout("WA-"+number.ID[:8], logLevel, true))
-		m.register(number.ID, client)
-		if err := client.Connect(); err != nil {
-			m.store.UpdateNumberStatus(ctx, number.ID, "disconnected", err.Error())
-			m.log.Error("gagal menghubungkan sesi", "number_id", number.ID, "error", err)
-		}
+		client, clientCtx, cancel := m.newClient(device, number.ID, logLevel)
+		m.register(number.ID, client, cancel)
+		m.connectSavedSession(number.ID, client, clientCtx)
 	}
 	return nil
 }
@@ -98,7 +132,7 @@ func (m *Manager) StartPairing(ctx context.Context, numberID, logLevel string) e
 	}
 
 	device := m.container.NewDevice()
-	client := whatsmeow.NewClient(device, waLog.Stdout("WA-"+numberID[:8], logLevel, true))
+	client, _, clientCancel := m.newClient(device, numberID, logLevel)
 	client.QRClientType = whatsmeow.PairClientChrome
 	pairCtx, cancel := context.WithCancel(context.Background())
 	qrChan, err := client.GetQRChannel(pairCtx)
@@ -109,11 +143,12 @@ func (m *Manager) StartPairing(ctx context.Context, numberID, logLevel string) e
 
 	m.mu.Lock()
 	m.clients[numberID] = client
-	m.cancels[numberID] = cancel
+	m.cancels[numberID] = clientCancel
 	m.mu.Unlock()
 	m.registerHandler(numberID, client)
 
 	go func() {
+		defer cancel()
 		for evt := range qrChan {
 			switch evt.Event {
 			case "code":
@@ -134,6 +169,7 @@ func (m *Manager) StartPairing(ctx context.Context, numberID, logLevel string) e
 	}()
 	if err := client.Connect(); err != nil {
 		cancel()
+		clientCancel()
 		m.mu.Lock()
 		delete(m.clients, numberID)
 		delete(m.cancels, numberID)
@@ -143,9 +179,64 @@ func (m *Manager) StartPairing(ctx context.Context, numberID, logLevel string) e
 	return nil
 }
 
-func (m *Manager) register(numberID string, client *whatsmeow.Client) {
+func (m *Manager) newClient(device *waStore.Device, numberID, logLevel string) (*whatsmeow.Client, context.Context, context.CancelFunc) {
+	clientCtx, cancel := context.WithCancel(context.Background())
+	client := whatsmeow.NewClient(device, waLog.Stdout("WA-"+numberID[:8], logLevel, true))
+	// A process restart commonly happens while the network is still coming up.
+	// Without this, a transient error from the first Connect call leaves a valid
+	// linked-device session idle until an operator starts a new QR pairing.
+	client.BackgroundEventCtx = clientCtx
+	client.InitialAutoReconnect = true
+	client.AutoReconnectHook = func(err error) bool {
+		m.log.Warn("sambung ulang WhatsApp gagal; akan dicoba lagi", "number_id", numberID, "error", err)
+		return true
+	}
+	return client, clientCtx, cancel
+}
+
+func (m *Manager) connectSavedSession(numberID string, client *whatsmeow.Client, clientCtx context.Context) {
+	if err := client.Connect(); err == nil {
+		return
+	} else {
+		m.log.Warn("koneksi awal sesi WhatsApp gagal; menjadwalkan percobaan ulang", "number_id", numberID, "error", err)
+		m.markReconnecting(numberID, err)
+	}
+
+	// InitialAutoReconnect covers network errors known by whatsmeow. Keep a
+	// small fallback here as well: a valid session must never be replaced with
+	// a new QR merely because the first websocket handshake failed.
+	go m.retrySavedSession(numberID, client, clientCtx)
+}
+
+func (m *Manager) retrySavedSession(numberID string, client *whatsmeow.Client, clientCtx context.Context) {
+	for attempt := 1; ; attempt++ {
+		delay := time.Duration(attempt) * 5 * time.Second
+		if delay > time.Minute {
+			delay = time.Minute
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-clientCtx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+		if client.Store.ID == nil || client.Store.Deleted || client.IsConnected() {
+			return
+		}
+		if err := client.Connect(); err != nil {
+			m.markReconnecting(numberID, err)
+			m.log.Warn("percobaan sambung ulang sesi WhatsApp gagal", "number_id", numberID, "attempt", attempt, "error", err)
+			continue
+		}
+		return
+	}
+}
+
+func (m *Manager) register(numberID string, client *whatsmeow.Client, cancel context.CancelFunc) {
 	m.mu.Lock()
 	m.clients[numberID] = client
+	m.cancels[numberID] = cancel
 	m.mu.Unlock()
 	m.registerHandler(numberID, client)
 }
@@ -162,15 +253,30 @@ func (m *Manager) registerHandler(numberID string, client *whatsmeow.Client) {
 				}
 			}
 		case *events.Disconnected:
-			_ = m.store.UpdateNumberStatus(context.Background(), numberID, "disconnected", "koneksi terputus")
+			m.markReconnecting(numberID, nil)
 		case *events.LoggedOut:
 			_ = m.store.UpdateNumberStatus(context.Background(), numberID, "logged_out", "sesi keluar dari WhatsApp")
+		case events.PermanentDisconnect:
+			// These are not ordinary network drops. In particular, StreamReplaced
+			// means another process is using the same saved session, so showing a
+			// QR code would only create an unnecessary second linked device.
+			_ = m.store.UpdateNumberStatus(context.Background(), numberID, "error", evt.PermanentDisconnectDescription())
 		case *events.Message:
 			if !evt.Info.IsFromMe {
 				m.handleMessage(numberID, evt)
 			}
 		}
 	})
+}
+
+func (m *Manager) markReconnecting(numberID string, err error) {
+	message := "koneksi sementara terputus; mencoba menyambung ulang"
+	if err != nil {
+		message = "gagal menyambung; mencoba lagi secara otomatis: " + err.Error()
+	}
+	if updateErr := m.store.UpdateNumberStatus(context.Background(), numberID, "reconnecting", message); updateErr != nil {
+		m.log.Error("gagal menyimpan status sambung ulang", "number_id", numberID, "error", updateErr)
+	}
 }
 
 func (m *Manager) handleMessage(numberID string, evt *events.Message) {

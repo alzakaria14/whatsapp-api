@@ -15,6 +15,7 @@ function formatDate(value){if(!value)return '—';return new Intl.DateTimeFormat
 function badge(value){return `<span class="badge ${escapeHTML(value)}">${escapeHTML(value.replace('_',' '))}</span>`}
 function phone(value){return value?`+${value}`:'Belum terhubung'}
 function icon(){return '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="2" width="10" height="20" rx="2"/><path d="M11 18h2"/></svg>'}
+function needsPairing(status){return status==='disconnected'||status==='logged_out'||status==='pairing'}
 function renderSenders(){
   const select=$('#send-from');
   const connected=state.numbers.filter(number=>number.status==='connected'&&number.phone);
@@ -31,7 +32,7 @@ async function loadNumbers(){
       <div class="card-top"><div class="device-title"><div class="device-icon">${icon()}</div><div><h3>${escapeHTML(n.name)}</h3><p>${escapeHTML(phone(n.phone))}</p></div></div>${badge(n.status)}</div>
       <div class="meta"><div class="meta-row"><span>Webhook</span><code title="${escapeHTML(n.webhook_url||'')}">${escapeHTML(n.webhook_url||'Belum diatur')}</code></div><div class="meta-row"><span>Terhubung</span><span>${formatDate(n.connected_at)}</span></div></div>
       ${n.last_error?`<p class="card-error">${escapeHTML(n.last_error)}</p>`:''}
-      <div class="card-actions">${n.status!=='connected'?'<button class="button primary pair" type="button">Tampilkan QR</button>':''}<button class="button ghost edit" type="button">Pengaturan</button><button class="button danger remove" type="button">Hapus</button></div>
+      <div class="card-actions">${needsPairing(n.status)?'<button class="button primary pair" type="button">Tampilkan QR</button>':''}<button class="button ghost edit" type="button">Pengaturan</button><button class="button danger remove" type="button">Hapus</button></div>
     </article>`).join('');
   }catch(error){grid.innerHTML=`<div class="empty"><h3>Gagal memuat data</h3><p>${escapeHTML(error.message)}</p></div>`}
 }

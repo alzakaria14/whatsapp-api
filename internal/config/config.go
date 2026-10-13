@@ -33,7 +33,7 @@ func Load() (Config, error) {
 	cfg := Config{
 		Addr:               get("APP_ADDR", ":8080"),
 		MySQLDSN:           strings.TrimSpace(os.Getenv("MYSQL_DSN")),
-		SessionDSN:         get("WHATSAPP_SESSION_DSN", "file:data/whatsapp.db?_foreign_keys=on"),
+		SessionDSN:         get("WHATSAPP_SESSION_DSN", "file:data/whatsapp.db?_foreign_keys=on&_busy_timeout=10000&_journal_mode=WAL"),
 		APIKey:             strings.TrimSpace(os.Getenv("API_KEY")),
 		DashboardUser:      get("DASHBOARD_USER", "admin"),
 		DashboardPassword:  strings.TrimSpace(os.Getenv("DASHBOARD_PASSWORD")),

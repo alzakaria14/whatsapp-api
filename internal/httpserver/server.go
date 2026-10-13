@@ -156,8 +156,12 @@ func (s *Server) restartPairing(w http.ResponseWriter, r *http.Request) {
 		s.storeError(w, err)
 		return
 	}
-	if number.Status == "connected" {
-		writeError(w, http.StatusConflict, "Nomor masih terhubung")
+	if number.Status == "connected" || number.Status == "reconnecting" {
+		writeError(w, http.StatusConflict, "Sesi masih aktif atau sedang menyambung ulang; QR tidak diperlukan")
+		return
+	}
+	if number.Status != "disconnected" && number.Status != "logged_out" && number.Status != "pairing" {
+		writeError(w, http.StatusConflict, "Sesi tidak dapat dipairing ulang; periksa status dan log gateway")
 		return
 	}
 	if err := s.wa.RestartPairing(r.Context(), id, s.cfg.LogLevel); err != nil {
